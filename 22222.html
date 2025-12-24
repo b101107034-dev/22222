@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EMR → A4 Excel 查房整理</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Noto Sans TC", sans-serif; margin: 18px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; max-width: 980px; }
+    textarea { width: 100%; min-height: 280px; padding: 10px; font-size: 14px; }
+    .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; font-size: 14px; cursor: pointer; }
+    input[type="text"] { padding: 9px 10px; font-size: 14px; width: 240px; }
+    .hint { color: #555; font-size: 13px; line-height: 1.5; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    .title { font-weight: 700; margin-bottom: 6px; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #fafafa; border: 1px solid #eee; padding: 10px; border-radius: 8px; }
+    @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } input[type="text"] { width: 100%; } }
+  </style>
+
+  <!-- SheetJS (XLSX) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <h2>EMR → A4 Excel 查房整理（貼病歷文字 → 下載 .xlsx）</h2>
+
+  <div class="row">
+    <div class="bar">
+      <input id="filename" type="text" value="emr_summary.xlsx" />
+      <button id="btnParse">解析預覽</button>
+      <button id="btnExport">匯出 Excel（A4）</button>
+      <button id="btnClear">清空</button>
+    </div>
+
+    <div class="hint">
+      你可以直接貼「去識別化」病歷文字（包含基本資料/CC/PMH(or underlying)/Dx/Labs/用藥/檢查）。<br/>
+      解析是 best-effort：有標題（如 CC/PMH/Dx/Lab/Medication/Imaging/Culture）會更準。<br/>
+      產出 Excel 會有：A4_Summary（適合一頁列印）＋ Labs/Meds/Studies（放完整明細）。
+    </div>
+
+    <textarea id="emr" placeholder="把病歷文字貼在這裡..."></textarea>
+
+    <div class="grid2">
+      <div class="card">
+        <div class="title">解析預覽（Summary）</div>
+        <pre id="previewSummary">（尚未解析）</pre>
+      </div>
+      <div class="card">
+        <div class="title">解析預覽（明細筆數）</div>
+        <pre id="previewCounts">（尚未解析）</pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+/** ---------- Utilities ---------- **/
+const SECTION_ALIASES = {
+  cc:      [/^CC\b/i, /Chief\s*complaint/i, /主訴/],
+  pmh:     [/^PMH\b/i, /Past\s*history/i, /Underlying\s*disease/i, /既往史/, /共病/, /病史/],
+  dx:      [/^Dx\b/i, /Diagnosis/i, /Impression/i, /診斷/, /問題清單/],
+  labs:    [/Lab/i, /Laboratory/i, /檢驗/, /抽血/],
+  meds:    [/Medication/i, /Medications/i, /用藥/, /處方/, /藥物/],
+  studies: [/Imaging/i, /Study/i, /Studies/i, /Culture/i, /檢查/, /影像/, /培養/],
+};
+
+const RE_BED = /(Bed|床號)[:：]?\s*([A-Za-z0-9\-]+)/i;
+const RE_MRN = /(MRN|Chart\s*No\.?|病歷號)[:：]?\s*([A-Za-z0-9\-]+)/i;
+const RE_AGE = /(Age|年齡)[:：]?\s*(\d{1,3})/i;
+const RE_SEX = /(Sex|Gender|性別)[:：]?\s*(Male|Female|M|F|男|女)/i;
+
+const DATE_RX = /\b(20\d{2}[/-]\d{1,2}[/-]\d{1,2})\b/;
+const LAB_TOKEN_RX = /([A-Za-z][A-Za-z0-9\-\/]*?)\s*[:=]?\s*([<>]?\d+(?:\.\d+)?%?|[A-Za-z\+\-]+)/g;
+
+// very loose med line: "DrugName IV q8h 2025-12-24" or Chinese route words
+const MED_LINE_RX = /^(?<name>.+?)\s+(?<route>IV|IM|SC|PO|PR|SL|Inj\.?|inj\.?|口服|針劑|靜脈|肌注|皮下)\s*(?<freq>q\d+h|qid|tid|bid|qd|qod|hs|qhs|prn|STAT|每\d+小時|一天\d+次|早晚|每日|需要時)?\s*(?<date>20\d{2}[/-]\d{1,2}[/-]\d{1,2})?/i;
+
+function normalizeDate(s){
+  if(!s) return "";
+  return s.trim().replaceAll("/", "-");
+}
+
+function splitSections(text){
+  const lines = text.split(/\r?\n/);
+  const hits = [];
+  for(let i=0;i<lines.length;i++){
+    const l = lines[i].trim();
+    if(!l) continue;
+    for(const [key, pats] of Object.entries(SECTION_ALIASES)){
+      if(pats.some(rx => rx.test(l.replace(/[:：]\s*$/, "")) && (l.endsWith(":") || l.endsWith("：") || l.length <= 40))){
+        hits.push([i, key]);
+        break;
+      }
+    }
+  }
+  const sections = {cc:"", pmh:"", dx:"", labs:"", meds:"", studies:""};
+  if(hits.length === 0) return sections;
+
+  hits.sort((a,b)=>a[0]-b[0]);
+  for(let idx=0; idx<hits.length; idx++){
+    const [start, key] = hits[idx];
+    const end = (idx+1 < hits.length) ? hits[idx+1][0] : lines.length;
+    sections[key] = lines.slice(start+1, end).join("\n").trim();
+  }
+  return sections;
+}
+
+function parseDemographics(text){
+  const bed = (text.match(RE_BED)||[])[2] || "";
+  const mrn = (text.match(RE_MRN)||[])[2] || "";
+  const age = (text.match(RE_AGE)||[])[2] || "";
+  let sex = (text.match(RE_SEX)||[])[2] || "";
+  if(sex){
+    const map = {M:"男", Male:"男", 男:"男", F:"女", Female:"女", 女:"女"};
+    sex = map[sex] || sex;
+  }
+  return {bed, mrn, age, sex};
+}
+
+function parseLabsBlock(block){
+  const labsByDate = {}; // date -> {analyte: value}
+  if(!block || !block.trim()) return labsByDate;
+  const lines = block.split(/\r?\n/);
+  for(const raw of lines){
+    const line = raw.trim();
+    if(!line) continue;
+    const dm = line.match(DATE_RX);
+    if(!dm) continue;
+    const date = normalizeDate(dm[1]);
+    const rest = line.slice(line.indexOf(dm[1]) + dm[1].length).trim().replace(/^[:：\- ]+/, "");
+    if(!rest) continue;
+    labsByDate[date] ||= {};
+    let m;
+    LAB_TOKEN_RX.lastIndex = 0;
+    while((m = LAB_TOKEN_RX.exec(rest)) !== null){
+      const k = m[1].trim();
+      const v = m[2].trim();
+      labsByDate[date][k] = v;
+    }
+  }
+  return labsByDate;
+}
+
+function parseMedsBlock(block){
+  const meds = [];
+  if(!block || !block.trim()) return meds;
+  for(const raw of block.split(/\r?\n/)){
+    const line = raw.trim();
+    if(!line) continue;
+    const m = line.match(MED_LINE_RX);
+    if(m && m.groups){
+      meds.push({
+        date: normalizeDate(m.groups.date || ""),
+        route: (m.groups.route || "").trim(),
+        freq: (m.groups.freq || "").trim(),
+        raw: line
+      });
+    } else {
+      meds.push({date:"", route:"", freq:"", raw: line});
+    }
+  }
+  return meds;
+}
+
+function parseStudiesBlock(block){
+  const studies = [];
+  if(!block || !block.trim()) return studies;
+  for(const raw of block.split(/\r?\n/)){
+    const line = raw.trim();
+    if(!line) continue;
+    const dm = line.match(DATE_RX);
+    if(dm){
+      studies.push({date: normalizeDate(dm[1]), text: line.replace(dm[1], "").trim().replace(/^[:：\- ]+/, "")});
+    } else {
+      studies.push({date:"", text: line});
+    }
+  }
+  return studies;
+}
+
+function pickLatestDate(labsByDate){
+  const dates = Object.keys(labsByDate).sort();
+  return dates.length ? dates[dates.length-1] : "";
+}
+
+/** ---------- Build Workbook ---------- **/
+function setA4PrintWS(ws){
+  // SheetJS supports "!pageSetup" for some viewers; Excel usually respects it when opening.
+  // We'll set A4, portrait, margins, fit-to-width.
+  ws["!pageSetup"] = {
+    paperSize: 9,           // 9 = A4
+    orientation: "portrait",
+    fitToWidth: 1,
+    fitToHeight: 1,
+  };
+  ws["!margins"] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 };
+}
+
+function aoaToWS(aoa){
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  return ws;
+}
+
+function setColWidths(ws, widths){
+  ws["!cols"] = widths.map(w => ({ wch: w }));
+}
+
+function parseAll(text){
+  const demo = parseDemographics(text);
+  const sections = splitSections(text);
+
+  const cc = (sections.cc || "").trim();
+  const pmh = (sections.pmh || "").trim();
+  const dx = (sections.dx || "").trim();
+
+  const labsByDate = parseLabsBlock(sections.labs || "");
+  const meds = parseMedsBlock(sections.meds || "");
+  const studies = parseStudiesBlock(sections.studies || "");
+
+  return { demo, cc, pmh, dx, labsByDate, meds, studies };
+}
+
+function buildWorkbook(parsed){
+  const wb = XLSX.utils.book_new();
+
+  /** A4 Summary */
+  const latest = pickLatestDate(parsed.labsByDate);
+  const labsLatest = latest ? parsed.labsByDate[latest] : {};
+  const keyLabs = ["WBC","Hb","Plt","Na","K","BUN","Cr","CRP","INR","APTT"];
+
+  const summaryAOA = [
+    ["住院醫師查房整理表（自動生成）"],
+    ["病床號", parsed.demo.bed || "", "病歷號", parsed.demo.mrn || "", "年紀", parsed.demo.age || "", "性別", parsed.demo.sex || ""],
+    ["Chief complaint", parsed.cc || ""],
+    ["Past history / Underlying disease", parsed.pmh || ""],
+    ["診斷", parsed.dx || ""],
+    [""],
+    ["Lab preview（最新日期）", latest || ""],
+    ...keyLabs.map(k => [k, labsLatest?.[k] || "", "備註", ""])
+  ];
+
+  const wsSummary = aoaToWS(summaryAOA);
+  // Merge title row
+  wsSummary["!merges"] = [
+    {s:{r:0,c:0}, e:{r:0,c:7}}, // title A1:H1
+    {s:{r:2,c:0}, e:{r:2,c:1}}, {s:{r:2,c:2}, e:{r:2,c:7}}, // CC label + content
+    {s:{r:3,c:0}, e:{r:3,c:1}}, {s:{r:3,c:2}, e:{r:3,c:7}}, // PMH
+    {s:{r:4,c:0}, e:{r:4,c:1}}, {s:{r:4,c:2}, e:{r:4,c:7}}, // Dx
+    {s:{r:6,c:0}, e:{r:6,c:1}}, {s:{r:6,c:2}, e:{r:6,c:7}}, // Lab preview header
+  ];
+
+  // Merge each key-lab row's "備註" area (col 2-3 or 3-7 style)
+  // In our layout: [k, val, 備註, ""]
+  // We'll merge 備註+空白 as wide comment area (C..H-ish). We used only 4 columns in those rows; keep simple.
+  // Set widths for A4 readability
+  setColWidths(wsSummary, [12, 18, 10, 42, 0,0,0,0]); // extra cols ignored by Excel if not used
+  setA4PrintWS(wsSummary);
+
+  XLSX.utils.book_append_sheet(wb, wsSummary, "A4_Summary");
+
+  /** Labs sheet */
+  const labRows = [["日期","項目","數值"]];
+  const dates = Object.keys(parsed.labsByDate).sort();
+  for(const d of dates){
+    const items = parsed.labsByDate[d];
+    for(const k of Object.keys(items).sort()){
+      labRows.push([d, k, items[k]]);
+    }
+  }
+  const wsLabs = aoaToWS(labRows);
+  setColWidths(wsLabs, [12, 14, 16]);
+  wsLabs["!pageSetup"] = { paperSize: 9, orientation:"portrait", fitToWidth:1, fitToHeight:0 };
+  wsLabs["!margins"] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 };
+  XLSX.utils.book_append_sheet(wb, wsLabs, "Labs");
+
+  /** Meds sheet */
+  const medRows = [["日期","途徑(針劑/口服)","頻次","用藥原文"]];
+  for(const m of parsed.meds){
+    medRows.push([m.date||"", m.route||"", m.freq||"", m.raw||""]);
+  }
+  const wsMeds = aoaToWS(medRows);
+  setColWidths(wsMeds, [12, 18, 10, 52]);
+  wsMeds["!pageSetup"] = { paperSize: 9, orientation:"portrait", fitToWidth:1, fitToHeight:0 };
+  wsMeds["!margins"] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 };
+  XLSX.utils.book_append_sheet(wb, wsMeds, "Meds");
+
+  /** Studies sheet */
+  const studyRows = [["日期","檢查/影像/培養內容"]];
+  for(const s of parsed.studies){
+    studyRows.push([s.date||"", s.text||""]);
+  }
+  const wsStudies = aoaToWS(studyRows);
+  setColWidths(wsStudies, [12, 64]);
+  wsStudies["!pageSetup"] = { paperSize: 9, orientation:"portrait", fitToWidth:1, fitToHeight:0 };
+  wsStudies["!margins"] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 };
+  XLSX.utils.book_append_sheet(wb, wsStudies, "Studies");
+
+  return wb;
+}
+
+function downloadWorkbook(wb, filename){
+  const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([wbout], {type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename || "emr_summary.xlsx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+
+/** ---------- UI events ---------- **/
+const elText = document.getElementById("emr");
+const elFile = document.getElementById("filename");
+const elPrevSum = document.getElementById("previewSummary");
+const elPrevCnt = document.getElementById("previewCounts");
+
+document.getElementById("btnClear").addEventListener("click", () => {
+  elText.value = "";
+  elPrevSum.textContent = "（尚未解析）";
+  elPrevCnt.textContent = "（尚未解析）";
+});
+
+document.getElementById("btnParse").addEventListener("click", () => {
+  const parsed = parseAll(elText.value || "");
+  const latest = pickLatestDate(parsed.labsByDate);
+  const lines = [];
+  lines.push(`床號: ${parsed.demo.bed || "—"} | 病歷號: ${parsed.demo.mrn || "—"} | 年紀: ${parsed.demo.age || "—"} | 性別: ${parsed.demo.sex || "—"}`);
+  lines.push("");
+  lines.push(`CC: ${parsed.cc ? parsed.cc.split(/\n/)[0] : "—"}`);
+  lines.push(`PMH: ${parsed.pmh ? parsed.pmh.split(/\n/)[0] : "—"}`);
+  lines.push(`Dx: ${parsed.dx ? parsed.dx.split(/\n/)[0] : "—"}`);
+  lines.push("");
+  lines.push(`Labs dates: ${Object.keys(parsed.labsByDate).length}（latest: ${latest || "—"}）`);
+  lines.push(`Meds lines: ${parsed.meds.length}`);
+  lines.push(`Studies lines: ${parsed.studies.length}`);
+  elPrevSum.textContent = lines.join("\n");
+
+  elPrevCnt.textContent =
+    JSON.stringify({
+      labs_dates: Object.keys(parsed.labsByDate).length,
+      meds_rows: parsed.meds.length,
+      studies_rows: parsed.studies.length
+    }, null, 2);
+});
+
+document.getElementById("btnExport").addEventListener("click", () => {
+  const parsed = parseAll(elText.value || "");
+  const wb = buildWorkbook(parsed);
+  downloadWorkbook(wb, (elFile.value || "emr_summary.xlsx").trim());
+});
+</script>
+</body>
+</html>
